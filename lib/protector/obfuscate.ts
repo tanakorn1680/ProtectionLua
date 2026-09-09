@@ -18,15 +18,12 @@ function makeVarName(index: number): string {
   return name
 }
 
-/** Encode string เป็น char codes */
+/** Encode string เป็น UTF-8 byte codes สำหรับ string.char() ใน Lua */
 function encodeString(str: string): string {
-  // คงไว้เป็น readable string สำหรับ basic level
-  // แปลงเฉพาะ non-ASCII หรือ string ยาวเกิน
-  if (str.length < 4 || /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(str)) {
-    return JSON.stringify(str)
-  }
-  const codes = Array.from(str).map(c => c.charCodeAt(0))
-  return `(function()local _s=""for _,_c in ipairs({${codes.join(',')}})do _s=_s..string.char(_c)end;return _s end)()`
+  // ใช้ UTF-8 bytes เพราะ Lua string.char() รับค่า 0-255 เท่านั้น
+  // charCodeAt() ให้ UTF-16 code units ที่อาจ > 255 สำหรับ Thai/Emoji
+  const bytes = Array.from(new TextEncoder().encode(str))
+  return `(function()local _s=""for _,_c in ipairs({${bytes.join(',')}})do _s=_s..string.char(_c)end;return _s end)()`
 }
 
 /** Basic obfuscation: rename locals, encode some strings */
@@ -73,11 +70,15 @@ export function obfuscateBasic(lua: string): string {
 
 /** String encryption สำหรับ Standard level */
 export function encodeStrings(lua: string): string {
-  // encode string literals ที่ยาวกว่า 3 chars
-  return lua.replace(/"([^"\\]{4,})"|'([^'\\]{4,})'/g, (match, d, s) => {
+  // encode เฉพาะ ASCII-only string literals ที่ยาวกว่า 3 chars
+  // \n ใน character class ป้องกันการ match ข้ามบรรทัด (multi-line string)
+  // non-ASCII (Thai/Emoji) ต้องข้ามเพราะ string.char() ใน Lua รับได้แค่ 0-255
+  return lua.replace(/"([^"\\\n]{4,})"|'([^'\\\n]{4,})'/g, (match, d, s) => {
     const str = d ?? s
-    // ข้ามถ้ามี escape sequences ซับซ้อน
+    // ข้ามถ้ามี backslash escape sequences
     if (/\\/.test(str)) return match
+    // ข้ามถ้ามี non-ASCII characters (Thai, Emoji, CJK ฯลฯ)
+    if (/[^\x00-\x7F]/.test(str)) return match
     return encodeString(str)
   })
 }
