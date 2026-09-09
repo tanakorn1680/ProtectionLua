@@ -7,12 +7,6 @@ import { requireAdmin } from '@/lib/auth'
 import { createServerClient } from '@/lib/supabase/server'
 import { encryptScript } from '@/lib/crypto'
 
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-}
-
 export async function GET(request: NextRequest) {
   const session = await requireAdmin(request)
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
