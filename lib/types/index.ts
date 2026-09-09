@@ -84,28 +84,3 @@ export interface DashboardStats {
   banned: number
   recent_checks: number
 }
-
-// ─── File Protection ───────────────────────────────────────────────────────
-
-export type ProtectionLevel = 'basic' | 'standard' | 'strong'
-export type ProtectionStatus = 'uploaded' | 'processing' | 'completed' | 'failed'
-export type LicenseMode = 'none' | 'require_validation'
-
-export interface ProtectedFile {
-  id: string
-  admin_id: string
-  original_filename: string
-  original_size: number
-  protected_filename: string | null
-  protected_size: number | null
-  protection_level: ProtectionLevel
-  license_mode: LicenseMode
-  license_id: string | null
-  status: ProtectionStatus
-  error_message: string | null
-  storage_path: string | null
-  created_at: string
-  updated_at: string
-  // joined
-  licenses?: { license_key: string; name: string | null } | null
-}
