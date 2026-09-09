@@ -92,10 +92,32 @@ export default function FilesPage() {
     }
   }
 
-  function handleDownload(file: ProtectedFile) {
+  async function handleDownload(file: ProtectedFile) {
     setDownloadingId(file.id)
-    window.location.href = `/api/admin/protected-files/${file.id}/download`
-    setTimeout(() => setDownloadingId(null), 2000)
+    try {
+      // ใช้ adminFetch เพื่อแนบ Authorization header
+      // API จะ redirect ไปยัง Signed URL → fetch ตาม redirect อัตโนมัติ
+      // ดึง final URL (signed URL) แล้วเปิดใน tab เพื่อ download
+      const res = await adminFetch(`/api/admin/protected-files/${file.id}/download`)
+      if (!res.ok) {
+        const json = await res.json().catch(() => ({}))
+        throw new Error(json.error ?? `ดาวน์โหลดล้มเหลว (${res.status})`)
+      }
+      // สร้าง blob แล้ว trigger download โดยไม่ต้องเปิด tab ใหม่
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = file.protected_filename ?? file.original_filename ?? 'protected.lua'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'ดาวน์โหลดล้มเหลว')
+    } finally {
+      setDownloadingId(null)
+    }
   }
 
   const totalPages = Math.ceil(total / limit)
