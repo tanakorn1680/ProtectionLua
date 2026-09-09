@@ -59,7 +59,6 @@ export function useAdmin() {
   return ctx
 }
 
-// Helper สำหรับทำ authenticated fetch ไปยัง API Routes
 export function useAdminFetch() {
   const { getToken, signOut } = useAdmin()
 
@@ -70,13 +69,22 @@ export function useAdminFetch() {
       throw new Error('Not authenticated')
     }
 
+    // ถ้าส่ง FormData อย่าใส่ Content-Type ให้ browser จัดการเอง
+    const isFormData = options?.body instanceof FormData
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token}`,
+    }
+    if (!isFormData) {
+      headers['Content-Type'] = 'application/json'
+    }
+    // merge headers จาก options (ถ้ามี)
+    if (options?.headers) {
+      Object.assign(headers, options.headers)
+    }
+
     const res = await fetch(url, {
       ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-        ...(options?.headers ?? {}),
-      },
+      headers,
     })
 
     if (res.status === 401) {
