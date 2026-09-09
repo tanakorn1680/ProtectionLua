@@ -34,7 +34,7 @@ function xorEncrypt(text: string, key: string): string {
   for (let i = 0; i < textBytes.length; i++) {
     result[i] = textBytes[i] ^ keyBytes[i % keyBytes.length]
   }
-  return btoa(String.fromCharCode(...result))
+  return btoa(Array.from(result).map(b => String.fromCharCode(b)).join(''))
 }
 
 export async function POST(request: NextRequest) {
