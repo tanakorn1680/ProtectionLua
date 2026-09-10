@@ -251,20 +251,20 @@ local function jsonEncode(t)
 end
 
 local function jsonGetStr(s, key)
-  return s:match('"' .. key .. '"\\s*:\\s*"([^"]*)"')
+  return s:match('"' .. key .. '"%s*:%s*"([^"]*)"')
 end
 local function jsonGetBool(s, key)
-  local v = s:match('"' .. key .. '"\\s*:\\s*(%a+)')
+  local v = s:match('"' .. key .. '"%s*:%s*(%a+)')
   return v == "true"
 end
 local function jsonGetInt(s, key)
-  local v = s:match('"' .. key .. '"\\s*:\\s*(%d+)')
+  local v = s:match('"' .. key .. '"%s*:%s*(%d+)')
   return tonumber(v)
 end
 
 -- parse JSON array of strings: ["aaa","bbb",...]
 local function jsonGetStrArray(s, key)
-  local arr = s:match('"' .. key .. '"\\s*:\\s*(%[.-%])')
+  local arr = s:match('"' .. key .. '"%s*:%s*(%[.-%])')
   if not arr then return nil end
   local items = {}
   for item in arr:gmatch('"([^"]*)"') do
