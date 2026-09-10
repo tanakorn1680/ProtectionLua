@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createServerClient } from '@/lib/supabase/server'
 import { getClientIp } from '@/lib/license'
 import { verifyRuntimeSession } from '@/lib/protector/session'
-import { hashToken, verifyIntegrity, prepareDeliveryXor } from '@/lib/protector/engine'
+import { hashToken, verifyIntegrity, prepareDeliveryChunks, CHUNK_SIZE } from '@/lib/protector/engine'
 import { checkRateLimit } from '@/lib/rateLimit'
 
 function deny(reason: string, status = 200) {
@@ -47,7 +47,7 @@ export async function POST(request: NextRequest) {
     return deny('invalid_session')
   }
 
-  // 2. ตรวจว่า protection_id ตรงกับที่อยู่ใน token
+  // 2. protection_id ต้องตรงกับที่อยู่ใน token
   if (sessionPayload.protection_id !== protection_id) {
     return deny('invalid_session')
   }
@@ -91,7 +91,7 @@ export async function POST(request: NextRequest) {
     return deny('session_expired')
   }
 
-  // 4. ตรวจ protection status (อาจถูก disable ระหว่าง session มีอยู่)
+  // 4. ตรวจ protection status
   const { data: script, error: scriptErr } = await supabase
     .from('protected_scripts')
     .select('status, payload_storage_path')
@@ -149,10 +149,10 @@ export async function POST(request: NextRequest) {
     return deny('server_error', 500)
   }
 
-  // 8. Prepare XOR delivery (decrypt stored payload → XOR with session token)
-  let deliveryData: { data: string; checksum: string }
+  // 8. Prepare chunk delivery (decrypt → obfuscate → split 512-byte chunks → XOR per chunk)
+  let delivery: { chunks: string[]; checksum: string; count: number }
   try {
-    deliveryData = await prepareDeliveryXor(payloadBuffer, session_token)
+    delivery = await prepareDeliveryChunks(payloadBuffer, session_token)
   } catch (e) {
     await supabase.from('protection_logs').insert({
       protection_id,
@@ -164,15 +164,16 @@ export async function POST(request: NextRequest) {
   }
 
   // 9. Update last_used
-  await supabase
-    .from('protected_scripts')
-    .update({ last_used_at: new Date().toISOString() })
-    .eq('protection_id', protection_id)
-
-  await supabase
-    .from('runtime_sessions')
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq('id', sessionRow.id)
+  await Promise.all([
+    supabase
+      .from('protected_scripts')
+      .update({ last_used_at: new Date().toISOString() })
+      .eq('protection_id', protection_id),
+    supabase
+      .from('runtime_sessions')
+      .update({ last_seen_at: new Date().toISOString() })
+      .eq('id', sessionRow.id),
+  ])
 
   // 10. Log success
   await supabase.from('protection_logs').insert({
@@ -183,11 +184,14 @@ export async function POST(request: NextRequest) {
     ip,
   })
 
+  // Response: chunks array + checksum + count + chunk_size (for Loader validation)
   return NextResponse.json({
     success: true,
-    data: deliveryData.data,
-    checksum: deliveryData.checksum,
-    algo: 1,
+    chunks: delivery.chunks,
+    checksum: delivery.checksum,
+    count: delivery.count,
+    chunk_size: CHUNK_SIZE,
+    algo: 2,
   })
 }
 

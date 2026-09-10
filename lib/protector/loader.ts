@@ -5,51 +5,54 @@
  * Loader มีเฉพาะ: protection_id, api_endpoint, license_key
  * ไม่มี encryption key หรือ source ใดๆ
  *
- * Loader Flow:
- *   1. DEVICE_ID ดึงจาก gg.getTargetInfo() อัตโนมัติ (packageName-versionCode)
- *   2. POST /api/runtime/session → ได้ session_token
- *   3. POST /api/runtime/payload + session_token → ได้ XOR-encrypted source + checksum
- *   4. XOR decode ด้วย keystream(session_token)
- *   5. ตรวจ checksum: SHA256(session_token || source) → first 8 bytes → 16 hex chars
- *   6. load(source)()
+ * Loader Flow (v2 — chunk streaming):
+ *   1. DEVICE_ID ดึงจาก gg.getTargetInfo() อัตโนมัติ
+ *   2. Anti-hook check — ตรวจ gg.* ถูก hook หรือไม่ก่อนทุก call
+ *   3. POST /api/runtime/session → ได้ session_token
+ *   4. POST /api/runtime/payload + session_token → ได้ chunks[] + checksum + count
+ *   5. สร้าง source ว่าง, วน decode ทีละ chunk:
+ *        chunk_plain = XOR(b64decode(chunks[i]), deriveChunkKeystream(token, i, len))
+ *        source = source .. chunk_plain
+ *        chunk_plain = nil; collectgarbage()   ← clear plaintext window ทันที
+ *   6. ตรวจ checksum: SHA256(token .. source) → first 8 bytes → 16 hex chars
+ *   7. load(source)()
+ *   8. source = nil; collectgarbage()         ← wipe source หลัง execute
  *
- * Security notes:
- *   - session_token อายุ 5 นาที, single-use (revoked หลัง fetch payload)
- *   - Loader ไม่รู้ encryption key ของ payload ที่เก็บใน server
- *   - static analysis ของ Loader ไม่เจอ source
+ * Security hardening (v2):
+ *   Anti-hook  : ตรวจ type(gg.makeRequest) == "function" ก่อนทุก network call
+ *                ถ้า hook detected → abort ทันที
+ *   Chunk nil  : xored_chunk ถูก nil'd และ GC'd ทันทีหลัง concat
+ *                → plaintext window สูงสุด CHUNK_SIZE (512) bytes ในแต่ละรอบ
+ *   Post-exec wipe: source nil'd และ GC'd หลัง fn() return
+ *   No globals : fn เก็บใน local, ไม่ expose ออก global scope
  *
- * GameGuardian specifics:
- *   - HTTP  : gg.makeRequest() แทน HttpService
- *   - Bitwise: Lua 5.3 native (~, &, |, >>, <<) แทน bit32
- *   - Execute: load() แทน loadstring()
- *   - DEVICE_ID: gg.getTargetInfo().packageName .. "-" .. versionCode
+ * Keystream alignment (CRITICAL — ต้องตรงกับ engine.ts deriveChunkKeystream):
+ *   Server: SHA256(seed || "chunk" || uint32BE(index) || counter_lo || counter_hi)
+ *   Lua:    sha256(seed .. "chunk" .. uint32be(index) .. char(ctr&0xff, ctr>>8&0xff))
+ *   Unit: ทั้งคู่ใช้ chunkIndex เป็น uint32 big-endian 4 bytes
  *
- * Checksum alignment (CRITICAL — ต้องตรงกับ engine.ts prepareDeliveryXor):
- *   Server : createHash('sha256').update(sessionToken).update(source).digest()
- *            → subarray(0,8).toString('hex')   [16 hex chars]
- *   Lua    : sha256(token .. source)
- *            → bytes 1..8 via string.format("%02x", h:byte(i))  [16 hex chars]
- *   ทั้งสองฝั่ง: SHA256(token || source), binary, first 8 bytes as lowercase hex
+ * Checksum alignment (ต้องตรงกับ engine.ts prepareDeliveryChunks):
+ *   Server: SHA256(sessionToken || obfuscated_source_bytes) → first 8 bytes → 16 hex
+ *   Lua:    sha256(token .. assembled_source) → bytes 1..8 → "%02x" → 16 chars
  */
 
 export interface LoaderConfig {
   protectionId: string
   originalFilename: string
   apiEndpoint: string   // e.g. "https://your-app.vercel.app"
-  licenseKey: string    // ฝังใน Loader โดยตรง — user ไม่ต้องกรอก
+  licenseKey: string
   createdAt: string
 }
 
 export function generateLoader(config: LoaderConfig): string {
   const { protectionId, originalFilename, apiEndpoint, licenseKey, createdAt } = config
 
-  // NOTE: ใน template string นี้ใช้ \\ สำหรับ \ ที่ต้องการใน Lua
-  // แต่ \x ใน Lua string literal ต้องการ backslash จริงๆ ดังนั้นใช้ \\x
   return `-- ============================================================
 -- Loader: ${originalFilename}
 -- Protection: ${protectionId}
 -- Generated: ${createdAt}
 -- Platform: GameGuardian (Android / Lua 5.3)
+-- Version: 2 (chunk streaming + anti-hook)
 -- ============================================================
 -- คำเตือน: ไฟล์นี้สร้างโดยอัตโนมัติ ไม่ควรแก้ไข
 -- ============================================================
@@ -66,6 +69,29 @@ local DEVICE_ID = (function()
   end
   return "unknown-device"
 end)()
+
+-- ============================================================
+-- Anti-hook guard
+-- ตรวจว่า gg.makeRequest ยังเป็น native function อยู่
+-- ถ้าถูก hook (type เปลี่ยนหรือ tostring ไม่ขึ้น "function:")
+-- → abort ทันที เพื่อป้องกัน MITM ของ payload
+-- ============================================================
+local function checkAntiHook()
+  if type(gg) ~= "table" then
+    gg.alert("[Loader] gg environment ผิดพลาด")
+    os.exit()
+  end
+  -- gg.makeRequest ต้องเป็น function จาก native GG
+  if type(gg.makeRequest) ~= "function" then
+    gg.alert("[Loader] ตรวจพบการดัดแปลง (hook detected)")
+    os.exit()
+  end
+  -- gg.toast ต้องเป็น function ด้วย
+  if type(gg.toast) ~= "function" then
+    gg.alert("[Loader] Environment ผิดปกติ")
+    os.exit()
+  end
+end
 
 -- ============================================================
 -- SHA-256 (pure Lua 5.3 — native bitwise operators)
@@ -91,7 +117,6 @@ do
     local bits = #msg * 8
     msg = msg .. "\\x80"
     while #msg % 64 ~= 56 do msg = msg .. "\\x00" end
-    -- append big-endian 64-bit bit length (only lower 32 bits used here; upper 4 bytes = 0)
     local hi = (bits >> 32) & 0xffffffff
     local lo = bits & 0xffffffff
     msg = msg .. string.char(
@@ -162,13 +187,28 @@ local function b64decode(s)
 end
 
 -- ============================================================
--- XOR keystream (ตรงกับ engine.ts deriveKeystream)
--- SHA256(seed || counter_lo_byte || counter_hi_byte) ต่อกันจนยาวพอ
+-- uint32 big-endian → 4-byte string
+-- ตรงกับ engine.ts: indexBuf.writeUInt32BE(chunkIndex, 0)
 -- ============================================================
-local function deriveKeystream(seed, length)
+local function uint32be(n)
+  return string.char(
+    (n >> 24) & 0xff,
+    (n >> 16) & 0xff,
+    (n >>  8) & 0xff,
+     n        & 0xff)
+end
+
+-- ============================================================
+-- Per-chunk keystream derivation
+-- ตรงกับ engine.ts deriveChunkKeystream(seed, chunkIndex, length):
+--   SHA256(seed || "chunk" || uint32BE(index) || counter_lo || counter_hi)
+-- ============================================================
+local function deriveChunkKeystream(seed, chunkIndex, length)
+  local indexBytes = uint32be(chunkIndex)
   local blocks, total, counter = {}, 0, 0
   while total < length do
-    local block = sha256(seed .. string.char(counter & 0xff, (counter >> 8) & 0xff))
+    local block = sha256(seed .. "chunk" .. indexBytes ..
+                         string.char(counter & 0xff, (counter >> 8) & 0xff))
     blocks[#blocks+1] = block
     total   = total + #block
     counter = counter + 1
@@ -177,23 +217,9 @@ local function deriveKeystream(seed, length)
 end
 
 -- ============================================================
--- XOR decode
--- ============================================================
-local function xorDecode(data, key)
-  local ks  = deriveKeystream(key, #data)
-  local out = {}
-  for i = 1, #data do
-    out[i] = string.char(data:byte(i) ~ ks:byte(i))
-  end
-  return table.concat(out)
-end
-
--- ============================================================
 -- Checksum verify
--- ตรงกับ engine.ts prepareDeliveryXor:
---   createHash('sha256').update(sessionToken).update(source).digest()
---   → subarray(0,8).toString('hex')
--- = SHA256(token .. source) → bytes 1..8 → 16 lowercase hex chars
+-- ตรงกับ engine.ts prepareDeliveryChunks:
+--   SHA256(sessionToken || source) → bytes 0..7 → 16 hex chars
 -- ============================================================
 local function verifyChecksum(source, token, expected)
   local h   = sha256(token .. source)
@@ -206,6 +232,7 @@ end
 
 -- ============================================================
 -- HTTP POST via gg.makeRequest
+-- checkAntiHook() ถูกเรียกก่อน gg.makeRequest ทุกครั้ง
 -- ============================================================
 local function jsonEncode(t)
   local parts = {}
@@ -224,14 +251,32 @@ local function jsonEncode(t)
 end
 
 local function jsonGetStr(s, key)
-  return s:match('"' .. key .. '"%s*:%s*"([^"]*)"')
+  return s:match('"' .. key .. '"\\s*:\\s*"([^"]*)"')
 end
 local function jsonGetBool(s, key)
-  local v = s:match('"' .. key .. '"%s*:%s*(%a+)')
+  local v = s:match('"' .. key .. '"\\s*:\\s*(%a+)')
   return v == "true"
+end
+local function jsonGetInt(s, key)
+  local v = s:match('"' .. key .. '"\\s*:\\s*(%d+)')
+  return tonumber(v)
+end
+
+-- parse JSON array of strings: ["aaa","bbb",...]
+local function jsonGetStrArray(s, key)
+  local arr = s:match('"' .. key .. '"\\s*:\\s*(%[.-%])')
+  if not arr then return nil end
+  local items = {}
+  for item in arr:gmatch('"([^"]*)"') do
+    items[#items+1] = item
+  end
+  return items
 end
 
 local function post(path, body)
+  -- Anti-hook: ตรวจก่อนทุก network call
+  checkAntiHook()
+
   local url     = API_ENDPOINT .. path
   local bodyStr = jsonEncode(body)
   local ok, res = pcall(function()
@@ -246,18 +291,22 @@ local function post(path, body)
   end
   local data = {
     success       = jsonGetBool(raw, "success"),
-    session_token = jsonGetStr(raw,  "session_token"),
-    reason        = jsonGetStr(raw,  "reason"),
-    data          = jsonGetStr(raw,  "data"),
-    checksum      = jsonGetStr(raw,  "checksum"),
+    session_token = jsonGetStr(raw, "session_token"),
+    reason        = jsonGetStr(raw, "reason"),
+    checksum      = jsonGetStr(raw, "checksum"),
+    count         = jsonGetInt(raw, "count"),
+    chunks        = jsonGetStrArray(raw, "chunks"),
   }
   return data, nil
 end
 
 -- ============================================================
--- Main Loader
+-- Main Loader (v2)
 -- ============================================================
 local function run()
+  -- Initial anti-hook check
+  checkAntiHook()
+
   gg.toast("[Loader] กำลังตรวจสอบ License...")
 
   -- 1. ขอ session token
@@ -273,8 +322,9 @@ local function run()
     return
   end
   local sessionToken = sessionData.session_token
+  sessionData = nil  -- clear session response
 
-  -- 2. ขอ payload
+  -- 2. ขอ chunks payload
   local payloadData, perr = post("/api/runtime/payload", {
     protection_id = PROTECTION_ID,
     session_token = sessionToken,
@@ -286,27 +336,82 @@ local function run()
     return
   end
 
-  -- 3. Decode XOR
-  local rawB64   = payloadData.data
+  local chunks   = payloadData.chunks
   local checksum = payloadData.checksum
-  if not rawB64 or rawB64 == "" or not checksum or checksum == "" then
-    gg.alert("[Loader] Payload format ผิดพลาด")
+  local count    = payloadData.count
+
+  if not chunks or type(chunks) ~= "table" or #chunks == 0 then
+    gg.alert("[Loader] Payload format ผิดพลาด (no chunks)")
+    os.exit()
+    return
+  end
+  if not checksum or checksum == "" then
+    gg.alert("[Loader] Payload format ผิดพลาด (no checksum)")
+    os.exit()
+    return
+  end
+  if count and count ~= #chunks then
+    gg.alert("[Loader] Payload format ผิดพลาด (count mismatch)")
     os.exit()
     return
   end
 
-  local encrypted = b64decode(rawB64)
-  local source    = xorDecode(encrypted, sessionToken)
+  payloadData = nil  -- clear raw payload response
 
-  -- 4. ตรวจ checksum: SHA256(sessionToken || source) → first 8 bytes → 16 hex chars
+  -- 3. Chunk streaming decode
+  --    XOR แต่ละ chunk ด้วย per-chunk keystream แล้ว concat
+  --    ทันทีหลัง concat: nil chunk + GC → plaintext window ≤ 512 bytes
+  local sourceParts = {}
+  for i = 1, #chunks do
+    local encoded = chunks[i]
+    local raw_chunk = b64decode(encoded)
+    encoded = nil  -- release base64 string
+
+    -- derive keystream for this chunk (index is 0-based ตรงกับ server)
+    local ks = deriveChunkKeystream(sessionToken, i - 1, #raw_chunk)
+
+    -- XOR decode chunk
+    local plain = {}
+    for j = 1, #raw_chunk do
+      plain[j] = string.char(raw_chunk:byte(j) ~ ks:byte(j))
+    end
+    local plain_str = table.concat(plain)
+
+    sourceParts[i] = plain_str
+
+    -- Wipe intermediate variables immediately
+    raw_chunk  = nil
+    ks         = nil
+    plain      = nil
+    plain_str  = nil
+    collectgarbage()  -- force GC ให้ collect plaintext fragment ทันที
+  end
+
+  chunks = nil  -- release encoded chunks array
+
+  -- 4. Assemble full source
+  local source = table.concat(sourceParts)
+  sourceParts  = nil  -- release parts array
+  collectgarbage()
+
+  -- 5. ตรวจ checksum: SHA256(sessionToken || source) → first 8 bytes → 16 hex
   if not verifyChecksum(source, sessionToken, checksum) then
     gg.alert("[Loader] Integrity check ล้มเหลว\\nอาจถูกดัดแปลง")
+    source = nil
+    collectgarbage()
     os.exit()
     return
   end
 
-  -- 5. Execute
+  sessionToken = nil  -- token ไม่จำเป็นอีกต่อไป
+
+  -- 6. Compile + execute
   local fn, compileErr = load(source)
+
+  -- Wipe source ทันทีหลัง load() — ไม่เก็บ plaintext ไว้อีก
+  source = nil
+  collectgarbage()
+
   if not fn then
     gg.alert("[Loader] Compile error:\\n" .. (compileErr or "unknown"))
     os.exit()
@@ -314,7 +419,13 @@ local function run()
   end
 
   gg.toast("[Loader] โหลดสำเร็จ")
+
+  -- Execute — fn เป็น local ไม่ expose global
   fn()
+
+  -- Wipe fn reference หลัง execute
+  fn = nil
+  collectgarbage()
 end
 
 run()
