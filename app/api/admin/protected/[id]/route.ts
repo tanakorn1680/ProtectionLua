@@ -165,12 +165,17 @@ export async function GET(
 
   const { data: script, error } = await supabase
     .from('protected_scripts')
-    .select('*')
+    .select('*, license:licenses(license_key)')
     .eq('id', params.id)
     .single()
 
   if (error || !script) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
+
+  const licenseKey = (script.license as { license_key: string } | null)?.license_key
+  if (!licenseKey) {
+    return NextResponse.json({ error: 'License ไม่พบ — ไม่สามารถสร้าง Loader ได้' }, { status: 500 })
   }
 
   const host = request.headers.get('host') ?? 'localhost:3000'
@@ -181,6 +186,7 @@ export async function GET(
     protectionId: script.protection_id,
     originalFilename: script.original_filename,
     apiEndpoint,
+    licenseKey,
     createdAt: new Date().toISOString(),
   })
 

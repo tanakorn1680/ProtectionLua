@@ -29,11 +29,12 @@ export interface LoaderConfig {
   protectionId: string
   originalFilename: string
   apiEndpoint: string   // e.g. "https://your-app.vercel.app"
+  licenseKey: string    // ฝังใน Loader โดยตรง — user ไม่ต้องกรอก
   createdAt: string
 }
 
 export function generateLoader(config: LoaderConfig): string {
-  const { protectionId, originalFilename, apiEndpoint, createdAt } = config
+  const { protectionId, originalFilename, apiEndpoint, licenseKey, createdAt } = config
 
   return `-- ============================================================
 -- Loader: ${originalFilename}
@@ -47,8 +48,7 @@ export function generateLoader(config: LoaderConfig): string {
 local PROTECTION_ID = "${protectionId}"
 local API_ENDPOINT  = "${apiEndpoint}"
 
--- ใส่ License Key ที่ได้รับมาตรงนี้
-local LICENSE_KEY = "YOUR-LICENSE-KEY-HERE"
+local LICENSE_KEY = "${licenseKey}"
 
 -- DEVICE_ID ดึงจาก GameGuardian อัตโนมัติ
 -- ใช้ packageName + versionCode เพื่อ binding กับเกมเวอร์ชันนี้
