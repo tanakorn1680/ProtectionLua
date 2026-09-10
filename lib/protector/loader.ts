@@ -2,27 +2,34 @@
  * Loader Generator — Server Only
  *
  * สร้าง Loader.lua สำหรับ GameGuardian บน Android
- * Loader มีเฉพาะ: protection_id, api_endpoint
- * ไม่มี Key, Secret, หรือ Source ใดๆ
+ * Loader มีเฉพาะ: protection_id, api_endpoint, license_key
+ * ไม่มี encryption key หรือ source ใดๆ
  *
  * Loader Flow:
  *   1. DEVICE_ID ดึงจาก gg.getTargetInfo() อัตโนมัติ (packageName-versionCode)
  *   2. POST /api/runtime/session → ได้ session_token
- *   3. POST /api/runtime/payload + session_token → ได้ XOR-encrypted source
- *   4. XOR decode ด้วย session_token → plain source bytes
- *   5. load(source)()
+ *   3. POST /api/runtime/payload + session_token → ได้ XOR-encrypted source + checksum
+ *   4. XOR decode ด้วย keystream(session_token)
+ *   5. ตรวจ checksum: SHA256(session_token || source) → first 8 bytes → 16 hex chars
+ *   6. load(source)()
  *
  * Security notes:
  *   - session_token อายุ 5 นาที, single-use (revoked หลัง fetch payload)
  *   - Loader ไม่รู้ encryption key ของ payload ที่เก็บใน server
  *   - static analysis ของ Loader ไม่เจอ source
- *   - ดัก HTTP → ได้ XOR data ที่ไม่มี key (key คือ session_token ที่ expire แล้ว)
  *
  * GameGuardian specifics:
  *   - HTTP  : gg.makeRequest() แทน HttpService
  *   - Bitwise: Lua 5.3 native (~, &, |, >>, <<) แทน bit32
  *   - Execute: load() แทน loadstring()
  *   - DEVICE_ID: gg.getTargetInfo().packageName .. "-" .. versionCode
+ *
+ * Checksum alignment (CRITICAL — ต้องตรงกับ engine.ts prepareDeliveryXor):
+ *   Server : createHash('sha256').update(sessionToken).update(source).digest()
+ *            → subarray(0,8).toString('hex')   [16 hex chars]
+ *   Lua    : sha256(token .. source)
+ *            → bytes 1..8 via string.format("%02x", h:byte(i))  [16 hex chars]
+ *   ทั้งสองฝั่ง: SHA256(token || source), binary, first 8 bytes as lowercase hex
  */
 
 export interface LoaderConfig {
@@ -36,6 +43,8 @@ export interface LoaderConfig {
 export function generateLoader(config: LoaderConfig): string {
   const { protectionId, originalFilename, apiEndpoint, licenseKey, createdAt } = config
 
+  // NOTE: ใน template string นี้ใช้ \\ สำหรับ \ ที่ต้องการใน Lua
+  // แต่ \x ใน Lua string literal ต้องการ backslash จริงๆ ดังนั้นใช้ \\x
   return `-- ============================================================
 -- Loader: ${originalFilename}
 -- Protection: ${protectionId}
@@ -47,11 +56,9 @@ export function generateLoader(config: LoaderConfig): string {
 
 local PROTECTION_ID = "${protectionId}"
 local API_ENDPOINT  = "${apiEndpoint}"
-
-local LICENSE_KEY = "${licenseKey}"
+local LICENSE_KEY   = "${licenseKey}"
 
 -- DEVICE_ID ดึงจาก GameGuardian อัตโนมัติ
--- ใช้ packageName + versionCode เพื่อ binding กับเกมเวอร์ชันนี้
 local DEVICE_ID = (function()
   local ok, info = pcall(function() return gg.getTargetInfo() end)
   if ok and info and info.packageName then
@@ -62,7 +69,6 @@ end)()
 
 -- ============================================================
 -- SHA-256 (pure Lua 5.3 — native bitwise operators)
--- ไม่ใช้ bit32 เพราะ GameGuardian ใช้ Lua 5.3+
 -- ============================================================
 local sha256
 do
@@ -85,11 +91,12 @@ do
     local bits = #msg * 8
     msg = msg .. "\\x80"
     while #msg % 64 ~= 56 do msg = msg .. "\\x00" end
-    msg = msg .. string.char(0,0,0,0,
-      (bits >> 24) & 0xff,
-      (bits >> 16) & 0xff,
-      (bits >>  8) & 0xff,
-       bits        & 0xff)
+    -- append big-endian 64-bit bit length (only lower 32 bits used here; upper 4 bytes = 0)
+    local hi = (bits >> 32) & 0xffffffff
+    local lo = bits & 0xffffffff
+    msg = msg .. string.char(
+      (hi >> 24) & 0xff, (hi >> 16) & 0xff, (hi >> 8) & 0xff, hi & 0xff,
+      (lo >> 24) & 0xff, (lo >> 16) & 0xff, (lo >>  8) & 0xff, lo & 0xff)
     for i = 1, #msg, 64 do
       local w = {}
       for j = 1, 16 do
@@ -156,6 +163,7 @@ end
 
 -- ============================================================
 -- XOR keystream (ตรงกับ engine.ts deriveKeystream)
+-- SHA256(seed || counter_lo_byte || counter_hi_byte) ต่อกันจนยาวพอ
 -- ============================================================
 local function deriveKeystream(seed, length)
   local blocks, total, counter = {}, 0, 0
@@ -181,12 +189,18 @@ local function xorDecode(data, key)
 end
 
 -- ============================================================
--- Checksum verify (ตรงกับ engine.ts: sha256(token..source) → first 8 bytes hex)
+-- Checksum verify
+-- ตรงกับ engine.ts prepareDeliveryXor:
+--   createHash('sha256').update(sessionToken).update(source).digest()
+--   → subarray(0,8).toString('hex')
+-- = SHA256(token .. source) → bytes 1..8 → 16 lowercase hex chars
 -- ============================================================
 local function verifyChecksum(source, token, expected)
   local h   = sha256(token .. source)
   local hex = ""
-  for i = 1, 8 do hex = hex .. string.format("%02x", h:byte(i)) end
+  for i = 1, 8 do
+    hex = hex .. string.format("%02x", h:byte(i))
+  end
   return hex == expected
 end
 
@@ -198,7 +212,6 @@ local function jsonEncode(t)
   for k, v in pairs(t) do
     local val
     if type(v) == "string" then
-      -- escape backslash และ double-quote
       val = '"' .. v:gsub('\\\\', '\\\\\\\\'):gsub('"', '\\\\"') .. '"'
     elseif v == nil then
       val = "null"
@@ -210,10 +223,8 @@ local function jsonEncode(t)
   return "{" .. table.concat(parts, ",") .. "}"
 end
 
--- JSON decode แบบ minimal สำหรับ response ที่รู้โครงสร้าง
 local function jsonGetStr(s, key)
-  local v = s:match('"' .. key .. '"%s*:%s*"([^"]*)"')
-  return v
+  return s:match('"' .. key .. '"%s*:%s*"([^"]*)"')
 end
 local function jsonGetBool(s, key)
   local v = s:match('"' .. key .. '"%s*:%s*(%a+)')
@@ -221,20 +232,18 @@ local function jsonGetBool(s, key)
 end
 
 local function post(path, body)
-  local url    = API_ENDPOINT .. path
+  local url     = API_ENDPOINT .. path
   local bodyStr = jsonEncode(body)
   local ok, res = pcall(function()
     return gg.makeRequest(url, {["Content-Type"] = "application/json"}, bodyStr)
   end)
   if not ok or not res then return nil, "http_error" end
-  -- gg.makeRequest คืน table {code, body} หรือ string
   local raw
   if type(res) == "table" then
     raw = res.body or res.content or ""
   else
     raw = tostring(res)
   end
-  -- parse fields ที่ต้องการ
   local data = {
     success       = jsonGetBool(raw, "success"),
     session_token = jsonGetStr(raw,  "session_token"),
@@ -289,14 +298,14 @@ local function run()
   local encrypted = b64decode(rawB64)
   local source    = xorDecode(encrypted, sessionToken)
 
-  -- 4. ตรวจ checksum
+  -- 4. ตรวจ checksum: SHA256(sessionToken || source) → first 8 bytes → 16 hex chars
   if not verifyChecksum(source, sessionToken, checksum) then
     gg.alert("[Loader] Integrity check ล้มเหลว\\nอาจถูกดัดแปลง")
     os.exit()
     return
   end
 
-  -- 5. Execute (GG ใช้ load() ไม่ใช่ loadstring())
+  -- 5. Execute
   local fn, compileErr = load(source)
   if not fn then
     gg.alert("[Loader] Compile error:\\n" .. (compileErr or "unknown"))

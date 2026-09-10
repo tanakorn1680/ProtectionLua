@@ -13,9 +13,9 @@
  *   - ตรวจ session token
  *   - อ่าน protected payload จาก Storage
  *   - decrypt + verify integrity
- *   - ตัดออกเป็น chunks เพื่อส่งกลับ
- *   - Loader รับ chunks + per-delivery IV แล้วประมวลผล
- *   - ห้ามส่ง source กลับมา
+ *   - XOR encode ด้วย session_token keystream
+ *   - คำนวณ checksum: SHA256(session_token || source) → first 8 bytes → 16 hex chars
+ *   - Loader รับ data + checksum แล้วประมวลผล
  *
  * NOTE: ไม่ import ไฟล์นี้ฝั่ง Client เด็ดขาด
  */
@@ -101,9 +101,9 @@ export function verifyIntegrity(frame: Buffer): boolean {
 
   const { hmacKey } = getKeys()
 
-  const iv       = frame.subarray(OFF_IV,      OFF_HMAC)
-  const storedMac = frame.subarray(OFF_HMAC,   OFF_AUTHTAG)
-  const authTag  = frame.subarray(OFF_AUTHTAG, OFF_CIPHER)
+  const iv        = frame.subarray(OFF_IV,      OFF_HMAC)
+  const storedMac = frame.subarray(OFF_HMAC,    OFF_AUTHTAG)
+  const authTag   = frame.subarray(OFF_AUTHTAG, OFF_CIPHER)
   const ciphertext = frame.subarray(OFF_CIPHER)
 
   const expected = createHmac('sha256', hmacKey)
@@ -119,76 +119,18 @@ export function verifyIntegrity(frame: Buffer): boolean {
 }
 
 /**
- * prepareDeliveryChunks(frame) → { chunks, deliveryIv, deliveryTag }
- *
- * สร้าง per-delivery encryption layer บน top ของ payload
- * เพื่อให้แต่ละ delivery request มี ciphertext ต่างกัน
- * Loader รับ chunks + IV แล้ว decrypt ด้วย session token (ที่ผูกอยู่)
- *
- * NOTE: เราไม่ส่ง source กลับ เราส่ง re-encrypted payload frame
- * Loader ต้อง call server-side executor แทนการ load source โดยตรง
- * แต่เนื่องจาก Roblox ต้องการ loadstring ให้ทำงานได้บน client,
- * เราจะส่ง encrypted source กลับ โดย delivery key ถูก derive จาก
- * session token ซึ่ง expire เร็วมาก (5 นาที) และ single-use per session
- *
- * Security rationale:
- * - Key ไม่เคยอยู่ใน Loader
- * - Key derive มาจาก short-lived session token ที่ Server ออกให้
- * - Token ถูก revoke หลังใช้ครั้งแรก (single-use payload fetch)
- * - ทำให้ "sniff HTTPS → replay" ไม่ได้เพราะ token หมดอายุ/ถูก revoke
- */
-export async function prepareDeliveryChunks(
-  frame: Buffer,
-  sessionToken: string
-): Promise<{ chunks: string[]; deliveryIv: string; deliveryTag: string }> {
-  // derive delivery key from session token (HKDF-like)
-  const deliveryKey = createHash('sha256')
-    .update('delivery-key')
-    .update(sessionToken)
-    .digest()
-
-  const deliveryIv = randomBytes(16)
-  const cipher = createCipheriv('aes-256-gcm', deliveryKey, deliveryIv)
-  const ct1 = cipher.update(frame)
-  const ct2 = cipher.final()
-  const tag = cipher.getAuthTag()
-  const encrypted = Buffer.concat([ct1, ct2])
-
-  // split into chunks ≤8KB for Roblox HTTP response handling
-  const CHUNK_SIZE = 8192
-  const chunks: string[] = []
-  for (let i = 0; i < encrypted.length; i += CHUNK_SIZE) {
-    chunks.push(encrypted.subarray(i, i + CHUNK_SIZE).toString('base64'))
-  }
-
-  return {
-    chunks,
-    deliveryIv: deliveryIv.toString('base64'),
-    deliveryTag: tag.toString('base64'),
-  }
-}
-
-/**
- * decryptDelivery — ใช้ใน Loader (Lua) เป็น conceptual counterpart
- * ไม่ได้ใช้ใน Node แต่แสดงให้เห็นว่า Loader ต้องทำอะไร:
- *
- * key = SHA256("delivery-key" .. session_token)  -- Lua ไม่มี SHA256 built-in
- *   → Loader ต้องขอ decrypted payload โดยตรงจาก Server แทน
- *
- * Revised approach: Server decrypt แล้วส่ง plaintext source กลับ
- * แต่เข้ารหัสด้วย session-derived key ซึ่ง Loader ต้องมี session_token
- * อยู่ใน memory เท่านั้น (ไม่มีอยู่ใน disk/file)
- *
- * สำหรับ Roblox ที่ไม่มี crypto library native:
- * → Server จะ decrypt payload แล้วใช้ loadstring execute server-side
- *    ไม่ได้ (เป็น client script) ดังนั้น:
- * → ใช้ simple XOR stream cipher ที่ Lua implement ได้ง่าย
- *    โดย key stream มาจาก SHA-256 ของ session_token ที่ expand ด้วย counter
+ * prepareDeliveryXor(frame, sessionToken)
+ *   → { data: base64(XOR(source, keystream(sessionToken))), checksum }
  *
  * XOR cipher ไม่ใช่ strong encryption แต่:
- * - key (session_token) อายุ 5 นาที single-use
- * - source ไม่ได้ถูก store ที่ Loader side
- * - ทำให้ static analysis ของ Loader ไม่เจอ source
+ *   - key (session_token) อายุ 5 นาที single-use
+ *   - source ไม่ถูก store ที่ Loader side
+ *   - static analysis ของ Loader ไม่เจอ source
+ *
+ * checksum: SHA256(sessionToken || source) → first 8 bytes → 16 hex chars
+ *   ↑ ต้องตรงกับ Lua verifyChecksum():
+ *     local h = sha256(token .. source)
+ *     for i = 1,8 do hex = hex .. string.format("%02x", h:byte(i)) end
  */
 export async function prepareDeliveryXor(
   frame: Buffer,
@@ -200,9 +142,9 @@ export async function prepareDeliveryXor(
 
   // decrypt the stored payload to get source back
   const { encKey } = getKeys()
-  const iv       = frame.subarray(OFF_IV,      OFF_HMAC)
-  const authTag  = frame.subarray(OFF_AUTHTAG, OFF_CIPHER)
-  const ct       = frame.subarray(OFF_CIPHER)
+  const iv      = frame.subarray(OFF_IV,      OFF_HMAC)
+  const authTag = frame.subarray(OFF_AUTHTAG, OFF_CIPHER)
+  const ct      = frame.subarray(OFF_CIPHER)
 
   const decipher = createDecipheriv('aes-256-gcm', encKey, iv)
   decipher.setAuthTag(authTag)
@@ -210,18 +152,20 @@ export async function prepareDeliveryXor(
   const source = await inflateRaw(compressed)
 
   // XOR with keystream derived from session token
-  // keystream: repeat SHA256(token + counter) until length matches
+  // keystream: repeat SHA256(token || [counter_lo, counter_hi]) until length matches
   const keystream = deriveKeystream(sessionToken, source.length)
   const xored = Buffer.allocUnsafe(source.length)
   for (let i = 0; i < source.length; i++) {
     xored[i] = source[i] ^ keystream[i]
   }
 
-  // checksum so Lua can verify decode was correct
-  const checksum = createHmac('sha256', sessionToken)
+  // checksum: SHA256(sessionToken || source) → first 8 bytes → 16 hex chars
+  // ต้องตรงกับ Lua: sha256(token .. source) → bytes 1..8 → "%02x"
+  const hashBuf = createHash('sha256')
+    .update(sessionToken)
     .update(source)
-    .digest('hex')
-    .slice(0, 16)  // 8-byte short tag (64 bits)
+    .digest()
+  const checksum = hashBuf.subarray(0, 8).toString('hex')  // 16 hex chars
 
   return {
     data: xored.toString('base64'),
