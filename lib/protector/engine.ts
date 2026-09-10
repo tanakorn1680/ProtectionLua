@@ -98,11 +98,12 @@ export function obfuscateLua(source: string): string {
   // Pass 2: encode string literals → \xNN
   out = encodeStrings(out)
 
-  // Pass 3: inject dead code at random positions
-  out = injectDeadCode(out)
+  // Pass 3 (dead code injection) — DISABLED
+  // Regex-based insertion without AST cannot guarantee valid insertion points.
+  // Injecting mid-block causes Lua parse errors inside load().
 
-  // Pass 4: pad with no-op expressions in top-level scope
-  out = injectNops(out)
+  // Pass 4 (no-op pad) — DISABLED
+  // Prepending statements risks breaking scripts with strict first-line structure.
 
   return out
 }
