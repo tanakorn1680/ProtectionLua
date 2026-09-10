@@ -146,7 +146,7 @@ function renameLocals(src: string): string {
 
   // substitute — whole-word only, skip inside string literals
   let result = src
-  for (const [orig, renamed] of candidates) {
+  for (const [orig, renamed] of candidates.entries()) {
     // word boundary replacement, careful not to hit substrings
     const re = new RegExp(`(?<![.:\\w])\\b${escapeRegex(orig)}\\b(?!\\s*=\\s*function\\s*\\()`, 'g')
     result = result.replace(re, renamed)
